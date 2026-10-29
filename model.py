@@ -26,6 +26,254 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class LinearLayer(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = False):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.layer = nn.Linear(self.in_dim, self.out_dim, bias = bias)
+        nn.init.normal_(self.layer.weight, mean=0, std=0.02)#math.sqrt(6.0/(self.in_dim + self.out_dim)))
+        if bias:
+            nn.init.zeros_(self.layer.bias)
+
+    def forward(self, x):
+        return self.layer(x)
+    
+class KimiDeltaAttention(nn.Module):
+    def __init__(self, dim: int, n_heads: int):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        assert (dim % n_heads == 0)
+        self.head_dim = self.dim // self.n_heads 
+        self.qkv = LinearLayer(self.dim, 3*self.dim)
+        self.beta = LinearLayer(self.dim, self.n_heads)
+        self.alpha_fc1 = LinearLayer(self.dim, self.dim // 2)
+        self.alpha_fc2 = LinearLayer(self.dim // 2, self.dim, bias = True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        B, T, _ = x.size()
+        H, D = self.n_heads, self.head_dim
+        q, k, v = torch.split(self.qkv(x), self.dim, dim=-1)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1,2) # B, H, T, D
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1,2) # B, H, T, D
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1,2) # B, H, T, D
+
+        beta = self.beta(x).view(B, T, H, 1, 1).transpose(1,2) # B, H, T, 1, 1
+
+        alpha = self.alpha_fc2(self.alpha_fc1(x)).view(B, T, H, D).transpose(1,2) # B, H T, D
+        alpha, beta = torch.sigmoid(alpha), torch.sigmoid(beta)
+
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        o = []
+        for t in range(T):
+            alpha_t = alpha[:,:, t, :].unsqueeze(-1)
+            S_bar = alpha_t * S
+            v_hat = k[:,:, t, :].unsqueeze(-2) @ S_bar # B, H, 1, D
+            v_hat = v_hat.squeeze(-2)
+            delta = v[:,:, t, :] - v_hat
+            update = k[:,:,t,:].unsqueeze(-1) @ delta.unsqueeze(-2) # B, H, D, D
+            S = S_bar + beta[:,:,t] * update 
+            o_t = S.transpose(-1, -2) @ q[:,:,t].unsqueeze(-1)
+            o.append(o_t.squeeze(-1)) # o_t = [ B, H, D]
+        o = torch.stack(o, dim=2) # B, H, T*D
+        return o.transpose(1,2).contiguous().view(B,T,self.dim)
+
+
+class KimiDeltaAttentionV2(nn.Module):
+    def __init__(self, dim: int, n_heads: int):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        assert (dim % n_heads == 0)
+        self.head_dim = self.dim // self.n_heads 
+        self.qkv = LinearLayer(self.dim, 3*self.dim)
+        self.beta = LinearLayer(self.dim, self.n_heads)
+        self.alpha_fc1 = LinearLayer(self.dim, self.dim // 2)
+        self.alpha_fc2 = LinearLayer(self.dim // 2, self.dim, bias = True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        B, T, _ = x.size()
+        H, D = self.n_heads, self.head_dim
+        q, k, v = torch.split(self.qkv(x), self.dim, dim=-1)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1,2) # B, H, T, D
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1,2) # B, H, T, D
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1,2) # B, H, T, D
+
+        beta = self.beta(x).view(B, T, H).transpose(1,2) # B, H, T
+        alpha = self.alpha_fc2(self.alpha_fc1(x)).view(B, T, H, D).transpose(1,2) # B, H T, D
+        alpha, beta = torch.sigmoid(alpha), torch.sigmoid(beta)
+
+        g = alpha.log().cumsum(dim=-2) # B, H, T, D
+
+        log_decay = g.unsqueeze(-2) - g.unsqueeze(-3) # B, H, T, T, D
+
+        causal = torch.ones(T, T, device=x.device, dtype=torch.bool).tril()
+
+        log_decay = log_decay.masked_fill(~causal.unsqueeze(-1), float("-inf"))
+
+        decay = log_decay.exp() # B, H, T, T, D
+
+        kk = (k.unsqueeze(-2) * decay * k.unsqueeze(-3)).sum(dim=-1) # B, H, T, T
+
+        identity = torch.eye(T, device=x.device, dtype=x.dtype)
+
+        L = identity + (beta.unsqueeze(-1) * kk).tril(diagonal=-1) # B, H, T, D
+
+        rhs = beta.unsqueeze(-1) * v # B, H, T, D
+
+        u = torch.linalg.solve_triangular(L, rhs, upper=False, unitriangular=True) # B, H, T, D
+
+        M = (q.unsqueeze(-2) * decay * k.unsqueeze(-3)).sum(dim=-1)
+
+        return (M @ u).transpose(1,2).contiguous().view(B, T, self.dim)
+
+
+class KimiDeltaAttentionV3(KimiDeltaAttentionV2):
+    def __init__(self, dim: int, n_heads: int, chunk_size: int = 64):
+        super().__init__(dim, n_heads)
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+        self.chunk_size = chunk_size
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.n_heads, self.head_dim
+
+        # Same projections and gates as V2.
+        q, k, v = self.qkv(x).split(self.dim, dim=-1)
+        q = q.view(B, T, H, D).transpose(1, 2)
+        k = k.view(B, T, H, D).transpose(1, 2)
+        v = v.view(B, T, H, D).transpose(1, 2)
+
+        beta = self.beta(x).view(B, T, H).transpose(1, 2).sigmoid()
+        alpha = self.alpha_fc2(self.alpha_fc1(x))
+        alpha = alpha.view(B, T, H, D).transpose(1, 2).sigmoid()
+
+        # NEW: carry the recurrent state between chunks.
+        state = x.new_zeros(B, H, D, D)
+        outputs = []
+
+        for start in range(0, T, self.chunk_size):
+            end = min(start + self.chunk_size, T)
+            C = end - start
+
+            qc = q[:, :, start:end, :]
+            kc = k[:, :, start:end, :]
+            vc = v[:, :, start:end, :]
+            ac = alpha[:, :, start:end, :]
+            bc = beta[:, :, start:end]
+
+            # Same pairwise decay as V2, restricted to this chunk.
+            g = ac.log().cumsum(dim=-2)       # (B, H, C, D)
+            log_decay = g.unsqueeze(-2) - g.unsqueeze(-3)
+
+            causal = torch.ones(
+                C, C, device=x.device, dtype=torch.bool
+            ).tril()
+
+            log_decay = log_decay.masked_fill(
+                ~causal.unsqueeze(-1), float("-inf")
+            )
+            decay = log_decay.exp()          # (B, H, C, C, D)
+
+            # Same L construction as V2.
+            kk = (
+                kc.unsqueeze(-2) * decay * kc.unsqueeze(-3)
+            ).sum(dim=-1)
+
+            identity = torch.eye(C, device=x.device, dtype=x.dtype)
+            L = identity + (
+                bc.unsqueeze(-1) * kk
+            ).tril(diagonal=-1)
+
+            # NEW: cumulative decay applied to the incoming state.
+            a = g.exp()                      # (B, H, C, D)
+
+            # CHANGED: subtract predictions from previous chunks.
+            rhs = bc.unsqueeze(-1) * (
+                vc - (kc * a) @ state
+            )
+
+            u = torch.linalg.solve_triangular(
+                L, rhs, upper=False, unitriangular=True
+            )
+
+            # Same M construction as V2.
+            M = (
+                qc.unsqueeze(-2) * decay * kc.unsqueeze(-3)
+            ).sum(dim=-1)
+
+            # CHANGED: queries also read memory from previous chunks.
+            output = (qc * a) @ state + M @ u
+            outputs.append(output)
+
+            # NEW: compute the state at this chunk's final token.
+            decay_to_end = decay[..., -1, :, :]  # (B, H, C, D)
+            weighted_keys = kc * decay_to_end
+
+            state = (
+                a[..., -1, :].unsqueeze(-1) * state
+                + weighted_keys.transpose(-1, -2) @ u
+            )
+
+        o = torch.cat(outputs, dim=2)        # (B, H, T, D)
+        return o.transpose(1, 2).contiguous().view(B, T, self.dim)
+        
+
+class KimiDeltaAttentionV4(KimiDeltaAttentionV3):
+    """Official FLA KDA kernel on CUDA; educational V3 on CPU/MPS.
+
+    Keeps the projections and state_dict compatible with V1-V3.
+    See third_party/README.md for the pinned upstream source and installation.
+    """
+
+    def __init__(self, dim: int, n_heads: int, chunk_size: int = 64):
+        super().__init__(dim, n_heads, chunk_size)
+        if chunk_size not in (32, 64):
+            raise ValueError("Official KDA supports chunk_size 32 or 64")
+        if self.head_dim > 256:
+            raise ValueError("Official KDA supports head_dim <= 256")
+
+    def forward(self, x):
+        if x.device.type != 'cuda':
+            return super().forward(x)
+        try:
+            from fla.ops.kda import chunk_kda
+        except ImportError as exc:
+            raise ImportError(
+                "V4 on CUDA requires official FLA. Run: "
+                "python -m pip install -r requirements-kda.txt"
+            ) from exc
+
+        B, T, _ = x.shape
+        q, k, v = self.qkv(x).split(self.dim, dim=-1)
+        q, k, v = [
+            tensor.reshape(B, T, self.n_heads, self.head_dim).contiguous()
+            for tensor in (q, k, v)
+        ]
+        beta = self.beta(x).float().sigmoid().contiguous()
+        logits = self.alpha_fc2(self.alpha_fc1(x))
+        # log(sigmoid(logits)), computed stably in FP32. FLA accumulates
+        # these per-token log gates internally; do not cumsum here.
+        g = F.logsigmoid(logits.float()).reshape(
+            B, T, self.n_heads, self.head_dim
+        ).contiguous()
+        output, _ = chunk_kda(
+            q=q, k=k, v=v, g=g, beta=beta,
+            scale=1.0,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            use_gate_in_kernel=False,
+            use_beta_sigmoid_in_kernel=False,
+            chunk_size=self.chunk_size,
+        )
+        return output.reshape(B, T, self.dim)
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -43,7 +291,7 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
+        if True: #not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -59,7 +307,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if False: # self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
@@ -97,6 +345,7 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
+        #self.attn = KimiDeltaAttentionV4(config.n_embd, config.n_head, config.chunk_size)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -114,6 +363,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    chunk_size: int = 64 # for KDA chunk_size 
 
 class GPT(nn.Module):
 
@@ -180,10 +430,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+        
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            #import pdb; pdb.set_trace()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

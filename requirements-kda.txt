@@ -1,0 +1,5 @@
+# Official FLA source snapshot, including its upstream MIT license.
+# Install from the repository root on the CUDA training machine.
+./third_party/flash-linear-attention.tar.gz
+torch>=2.7.0
+triton>=3.3; sys_platform == "linux"
